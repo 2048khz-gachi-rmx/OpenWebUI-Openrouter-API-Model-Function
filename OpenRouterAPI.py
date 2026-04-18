@@ -47,15 +47,17 @@ Changelog:
 
 import re
 import requests
+import aiohttp
+import asyncio
 import json
 import traceback  # Import traceback for detailed error logging
-from typing import Optional, List, Union, Generator, Iterator
+from typing import AsyncGenerator, Optional, List, Union, Generator
 from pydantic import BaseModel, Field
 from datetime import datetime
 
 
 # --- Helper function for citation text insertion ---
-def _insert_citations(text: str, citations: list[str]) -> str:
+def insert_citations(text: str, citations: list[str]) -> str:
     """
     Replace citation markers [n] in text with markdown links to the corresponding citation URLs.
 
@@ -90,7 +92,7 @@ def _insert_citations(text: str, citations: list[str]) -> str:
 
 
 # --- Helper function for formatting the final citation list ---
-def _format_citation_list(citations: list[str]) -> str:
+def format_citation_list(citations: list[str]) -> str:
     """
     Formats a list of citation URLs into a markdown string.
 
@@ -221,6 +223,7 @@ def _process_effort_from_message(
 
     return default_effort, ""
 
+_USAGE_PATTERN = re.compile(r"\n\n---\n\*\*Usage\:\*\*.*?\$\d+\.\d{4}")
 
 # --- Helper function to remove notification lines from messages ---
 def _sanitize_messages_for_notifications(messages: list) -> list:
@@ -239,24 +242,26 @@ def _sanitize_messages_for_notifications(messages: list) -> list:
     if not isinstance(messages, list):
         return messages
 
-    _USAGE_PATTERN = re.compile(r"\n\n---\n\*\*Usage\:\*\*.*?\$\d+\.\d{4}")
-
     def remove_notification_lines(text: str) -> str:
         if not isinstance(text, str) or not text:
             return text
-        lines = text.splitlines()
-        filtered_lines: list[str] = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("> *Reasoning set to ") and stripped.endswith("*"):
-                continue
-            if stripped.startswith("> *Ignoring providers for ") and stripped.endswith("*"):
-                continue
-            filtered_lines.append(line)
 
-        result = "\n".join(filtered_lines)
+        result = text
 
-        # Remove the token usage strings strings
+        if "> *" in text:
+            lines = text.splitlines()
+            filtered_lines: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("> *Reasoning set to ") and stripped.endswith("*"):
+                    continue
+                if stripped.startswith("> *Ignoring providers for ") and stripped.endswith("*"):
+                    continue
+                filtered_lines.append(line)
+
+            result = "\n".join(filtered_lines)
+
+        # Remove the token usage strings. Kept for backwards compatibility (before v0.4.6, usage stats went into the assistant response)
         result = re.sub(_USAGE_PATTERN, "", result)
         return result
 
@@ -340,7 +345,7 @@ class Pipe:
         if not self.valves.OPENROUTER_API_KEY:
             print("Warning: OPENROUTER_API_KEY is not set in Valves.")
 
-    def pipes(self) -> List[dict]:
+    async def pipes(self) -> List[dict]:
         """
         Fetches available models from the OpenRouter API.
         This method is called by OpenWebUI to discover the models this pipe provides.
@@ -352,14 +357,15 @@ class Pipe:
 
         try:
             headers = {"Authorization": f"Bearer {self.valves.OPENROUTER_API_KEY}"}
-            response = requests.get(
-                "https://openrouter.ai/api/v1/models",
-                headers=headers,
-                timeout=self.valves.REQUEST_TIMEOUT,
-            )
-            response.raise_for_status()
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://openrouter.ai/api/v1/models",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT),
+                ) as response:
+                    response.raise_for_status()
+                    models_data = await response.json()
 
-            models_data = response.json()
             raw_models_data = models_data.get("data", [])
             models: List[dict] = []
 
@@ -442,8 +448,8 @@ class Pipe:
                 })
 
             if not models:
-                if self.valves.FREE_ONLY:
-                    return [{"id": "error", "name": "Pipe Error: No free models found"}]
+                if self.valves.MAX_INPUT_PRICE:
+                    return [{"id": "error", "name": "Pipe Error: No models matching the price condition found"}]
                 elif whitelist_models:
                     return [
                         {
@@ -468,33 +474,27 @@ class Pipe:
 
             return models
 
-        except requests.exceptions.Timeout:
+        except aiohttp.ClientConnectorError:
+            print("Error fetching models: Network connection failed.")
+            return [{"id": "error", "name": "Pipe Error: Network error fetching models"}]
+        except asyncio.TimeoutError:
             print("Error fetching models: Request timed out.")
             return [{"id": "error", "name": "Pipe Error: Timeout fetching models"}]
-        except requests.exceptions.HTTPError as e:
-            error_msg = f"Pipe Error: HTTP {e.response.status_code} fetching models"
+        except aiohttp.ClientResponseError as e:
+            error_msg = f"Pipe Error: HTTP {e.status} fetching models"
             try:
-                error_detail = e.response.json().get("error", {}).get("message", "")
-                if error_detail:
-                    error_msg += f": {error_detail}"
-            except json.JSONDecodeError:
+                if e.message:
+                    error_msg += f": {e.message}"
+            except Exception:
                 pass
-            print(f"Error fetching models: {error_msg} (URL: {e.request.url})")
+            print(f"Error fetching models: {error_msg}")
             return [{"id": "error", "name": error_msg}]
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching models: Request failed: {e}")
-            return [
-                {
-                    "id": "error",
-                    "name": f"Pipe Error: Network error fetching models: {e}",
-                }
-            ]
         except Exception as e:
             print(f"Unexpected error fetching models: {e}")
             traceback.print_exc()
             return [{"id": "error", "name": f"Pipe Error: Unexpected error: {e}"}]
 
-    def pipe(self, body: dict) -> Union[str, Generator, Iterator]:
+    async def pipe(self, body: dict) -> str | AsyncGenerator | dict:
         """
         Processes incoming chat requests. This is the main function called by OpenWebUI
         when a user interacts with a model provided by this pipe.
@@ -522,10 +522,6 @@ class Pipe:
                 effort_level, effort_notification = _process_effort_from_message(
                     payload["messages"], effort_level
                 )
-
-            # Store effort notification for response formatting
-            self._effort_notification = effort_notification
-            # --- End effort detection ---
 
             # --- Apply Cache Control Logic ---
             if self.valves.ENABLE_CACHE_CONTROL and "messages" in payload:
@@ -598,46 +594,46 @@ class Pipe:
                 model_id = payload["model"]
                 blacklist_str = self.valves.MODEL_PROVIDER_BLACKLIST.strip()
                 ignored_providers = []
-                
+
                 try:
                     # Parse format: 'model1:provider1,provider2;model2:provider3'
                     for model_rule in blacklist_str.split(';'):
                         if ':' in model_rule:
                             model_pattern, providers_str = model_rule.split(':', 1)
                             model_pattern = model_pattern.strip().lower()
-                            
+
                             # Check if current model matches the pattern
                             model_name_part = (
                                 model_id.split("/", 1)[1].lower()
                                 if "/" in model_id
                                 else model_id.lower()
                             )
-                            
+
                             # Support partial matching for model names
                             if model_pattern in model_name_part or model_pattern in model_id.lower():
                                 providers = [
-                                    p.strip().lower() 
-                                    for p in providers_str.split(',') 
+                                    p.strip().lower()
+                                    for p in providers_str.split(',')
                                     if p.strip()
                                 ]
                                 ignored_providers.extend(providers)
-                
+
                     # Apply provider blacklist to request if any providers should be ignored
                     if ignored_providers:
                         # Remove duplicates while preserving order
                         ignored_providers = list(dict.fromkeys(ignored_providers))
-                        
+
                         # Add provider object to payload
                         if "provider" not in payload:
                             payload["provider"] = {}
                         payload["provider"]["ignore"] = ignored_providers
-                        
+
                         # Create notification
                         blacklist_notification = f"> *Ignoring providers for {model_id}: {', '.join(ignored_providers)}*\n\n"
-                        
+
                 except Exception as e:
                     print(f"Warning: Error applying MODEL_PROVIDER_BLACKLIST: {e}")
-            
+
             # Store blacklist notification for response formatting
             self._blacklist_notification = blacklist_notification
             # --- End Model-Specific Provider Blacklist ---
@@ -660,56 +656,54 @@ class Pipe:
                     url,
                     headers,
                     payload,
-                    _insert_citations,
-                    _format_citation_list,
-                    self.valves.REQUEST_TIMEOUT,
+                    effort_notification,
                 )
             else:
-                content, usage = self.non_stream_response(
+                content, usage = await self.non_stream_response(
                     url,
                     headers,
                     payload,
-                    _insert_citations,
-                    _format_citation_list,
-                    self.valves.REQUEST_TIMEOUT,
+                    effort_notification,
                 )
                 return {"content": content, "usage": usage}
+
 
         except Exception as e:
             print(f"Error preparing request in pipe method: {e}")
             traceback.print_exc()
             return f"Pipe Error: Failed to prepare request: {e}"
 
-    def non_stream_response(
-        self, url, headers, payload, citation_inserter, citation_formatter, timeout
-    ) -> str:
+    async def non_stream_response(
+        self, url, headers, payload, effort_notification
+    ) -> tuple[str, dict]:
         """Handles non-streaming API requests."""
         try:
-            response = requests.post(
-                url, headers=headers, json=payload, timeout=timeout
-            )
-            response.raise_for_status()
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT)
+                ) as response:
+                    response.raise_for_status()
+                    res = await response.json()
 
-            res = response.json()
+            usage = res.get("usage", {})
+
             if not res.get("choices"):
-                return ""
+                return "", usage
 
             choice = res["choices"][0]
             message = choice.get("message", {})
             citations = res.get("citations", [])
-            usage = res.get("usage", {})
 
             content = message.get("content", "")
             reasoning = message.get("reasoning", "")
 
-            content = citation_inserter(content, citations)
-            reasoning = citation_inserter(reasoning, citations)
-            citation_list = citation_formatter(citations)
+            content = insert_citations(content, citations)
+            reasoning = insert_citations(reasoning, citations)
+            citation_list = format_citation_list(citations)
 
             final = ""
 
             # Add effort notification if present
-            effort_notification = getattr(self, "_effort_notification", "")
             if effort_notification:
                 final += effort_notification
 
@@ -726,112 +720,110 @@ class Pipe:
                 final += citation_list
             return final, usage
 
-        except requests.exceptions.Timeout:
-            return f"Pipe Error: Request timed out ({timeout}s)"
-        except requests.exceptions.HTTPError as e:
-            error_msg = f"Pipe Error: API returned HTTP {e.response.status_code}"
+        except aiohttp.ClientConnectorError:
+            return "Pipe Error: Network connection failed", {}
+        except asyncio.TimeoutError:
+            return f"Pipe Error: Request timed out ({self.valves.REQUEST_TIMEOUT}s)", {}
+        except aiohttp.ClientResponseError as e:
+            error_msg = f"Pipe Error: API returned HTTP {e.status}"
             try:
-                detail = e.response.json().get("error", {}).get("message", "")
-                if detail:
-                    error_msg += f": {detail}"
+                if e.message:
+                    error_msg += f": {e.message}"
             except Exception:
                 pass
-            return error_msg
+            return error_msg, {}
         except Exception as e:
             print(f"Unexpected error in non_stream_response: {e}")
             traceback.print_exc()
-            return f"Pipe Error: Unexpected error processing response: {e}"
+            return f"Pipe Error: Unexpected error processing response: {e}", {}
 
-    def stream_response(
-        self, url, headers, payload, citation_inserter, citation_formatter, timeout
-    ) -> Generator[str, None, None]:
+    async def stream_response(
+        self, url, headers, payload, effort_notification
+    ) -> AsyncGenerator[str, None]:
         """Handles streaming API requests using a generator."""
-        response = None
         try:
-            response = requests.post(
-                url, headers=headers, json=payload, stream=True, timeout=timeout
-            )
-            response.raise_for_status()
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT)
+                ) as response:
+                    response.raise_for_status()
 
-            in_think = False
-            latest_citations: List[str] = []
-            latest_usage = {}
-            first_chunk = True
+                    in_think = False
+                    latest_citations: List[str] = []
+                    latest_usage = {}
+                    first_chunk = True
 
-            for line in response.iter_lines(chunk_size=1024):
-                if not line or not line.startswith(b"data: "):
-                    continue
-                data = line[len(b"data: ") :].decode("utf-8")
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+                    async for line in response.content:
+                        line = line.decode("utf-8").strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data = line[len("data: "):]
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
 
-                if "choices" in chunk:
-                    choice = chunk["choices"][0]
-                    citations = chunk.get("citations")
-                    if citations is not None:
-                        latest_citations = citations
-                    
-                    # Track usage information
-                    usage = chunk.get("usage")
-                    if usage is not None:
-                        latest_usage = usage
-                    
-                    delta = choice.get("delta", {})
-                    content = delta.get("content", "")
-                    reasoning = delta.get("reasoning", "")
+                        if "choices" in chunk:
+                            choice = chunk["choices"][0]
+                            citations = chunk.get("citations")
+                            if citations is not None:
+                                latest_citations = citations
 
-                    # Add effort notification at the beginning
-                    if first_chunk:
-                        effort_notification = getattr(self, "_effort_notification", "")
-                        if effort_notification:
-                            yield effort_notification
-                        
-                        # Add blacklist notification if present
-                        blacklist_notification = getattr(self, "_blacklist_notification", "")
-                        if blacklist_notification:
-                            yield blacklist_notification
-                        
-                        first_chunk = False
+                            # Track usage information
+                            usage = chunk.get("usage")
+                            if usage is not None:
+                                latest_usage = usage
 
-                    # Stream reasoning immediately
-                    if reasoning:
-                        if not in_think:
-                            yield "<think>\n"
-                            in_think = True
-                        yield citation_inserter(reasoning, latest_citations)
+                            delta = choice.get("delta", {})
+                            content = delta.get("content", "")
+                            reasoning = delta.get("reasoning", "")
 
-                    # Stream content immediately
-                    if content:
-                        if in_think:
-                            yield "\n</think>\n\n"
-                            in_think = False
-                        yield citation_inserter(content, latest_citations)
+                            # Add effort notification at the beginning
+                            if first_chunk:
+                                if effort_notification:
+                                    yield effort_notification
 
-            # If model ended while still in <think>, close it
-            if in_think:
-                yield "\n</think>\n\n"
-            
-            # Append citations list
-            yield citation_formatter(latest_citations)
+                                # Add blacklist notification if present
+                                blacklist_notification = getattr(self, "_blacklist_notification", "")
+                                if blacklist_notification:
+                                    yield blacklist_notification
 
-            # Yield final usage data if available
-            if latest_usage:
-                yield f"data: {json.dumps({'usage': latest_usage})}\n\n"
+                                first_chunk = False
+
+                            # Stream reasoning immediately
+                            if reasoning:
+                                if not in_think:
+                                    yield "<think>\n"
+                                    in_think = True
+                                yield insert_citations(reasoning, latest_citations)
+
+                            # Stream content immediately
+                            if content:
+                                if in_think:
+                                    yield "\n</think>\n\n"
+                                    in_think = False
+                                yield insert_citations(content, latest_citations)
+
+                    # If model ended while still in <think>, close it
+                    if in_think:
+                        yield "\n</think>\n\n"
+
+                    # Append citations list
+                    yield format_citation_list(latest_citations)
+
+                    # Yield final usage data if available
+                    if latest_usage:
+                        yield f"data: {json.dumps({'usage': latest_usage})}\n\n"
 
         except GeneratorExit:
-            if response:
-                response.close()
             return
-        except requests.exceptions.Timeout:
-            yield f"Pipe Error: Request timed out ({timeout}s)"
-        except requests.exceptions.HTTPError as e:
-            yield f"Pipe Error: API returned HTTP {e.response.status_code}"
+        except aiohttp.ClientConnectorError:
+            yield "Pipe Error: Network connection failed"
+        except asyncio.TimeoutError:
+            yield f"Pipe Error: Request timed out ({self.valves.REQUEST_TIMEOUT}s)"
+        except aiohttp.ClientResponseError as e:
+            yield f"Pipe Error: API returned HTTP {e.status}"
         except Exception as e:
             yield f"Pipe Error: Unexpected error during streaming: {e}"
-        finally:
-            if response:
-                response.close()
