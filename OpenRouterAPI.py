@@ -46,17 +46,17 @@ Changelog:
 """
 
 import re
-import requests
 import aiohttp
 import asyncio
 import json
 import traceback  # Import traceback for detailed error logging
-from typing import AsyncGenerator, Optional, List, Union, Generator
+from typing import AsyncGenerator, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
 
+USAGE_PATTERN = re.compile(r"\n\n---\n\*\*Usage\:\*\*.*?\$\d+\.\d{4}")
+CITATION_PATTERN = re.compile(r"\[(\d+)\]")
 
-# --- Helper function for citation text insertion ---
 def insert_citations(text: str, citations: list[str]) -> str:
     """
     Replace citation markers [n] in text with markdown links to the corresponding citation URLs.
@@ -71,8 +71,6 @@ def insert_citations(text: str, citations: list[str]) -> str:
     if not citations or not text:
         return text
 
-    pattern = r"\[(\d+)\]"
-
     def replace_citation(match_obj):
         try:
             num = int(match_obj.group(1))
@@ -85,13 +83,12 @@ def insert_citations(text: str, citations: list[str]) -> str:
             return match_obj.group(0)
 
     try:
-        return re.sub(pattern, replace_citation, text)
+        return re.sub(CITATION_PATTERN, replace_citation, text)
     except Exception as e:
         print(f"Error during citation insertion: {e}")
         return text
 
 
-# --- Helper function for formatting the final citation list ---
 def format_citation_list(citations: list[str]) -> str:
     """
     Formats a list of citation URLs into a markdown string.
@@ -114,8 +111,7 @@ def format_citation_list(citations: list[str]) -> str:
         return ""
 
 
-# --- Helper function for pricing formatting ---
-def _format_pricing(model_data: dict) -> tuple:
+def format_pricing(model_data: dict) -> tuple[str, str, str]:
     """
     Format pricing information from model data.
 
@@ -128,13 +124,13 @@ def _format_pricing(model_data: dict) -> tuple:
     try:
         pricing = model_data.get("pricing", {})
         if not pricing:
-            return ""
+            return "", "", ""
 
         prompt_price = pricing.get("prompt")
         completion_price = pricing.get("completion")
 
         if prompt_price is None or completion_price is None:
-            return ""
+            return "", "", ""
 
         # Convert from per-token to per-1M tokens for readability
         prompt_per_1m = max(-1, float(prompt_price) * 1_000_000)
@@ -147,13 +143,10 @@ def _format_pricing(model_data: dict) -> tuple:
         print(
             f"Error formatting pricing for model {model_data.get('id', 'unknown')}: {e}"
         )
-        return ""
+        return "", "", ""
 
 
-# --- Helper function for effort detection and message processing ---
-def _process_effort_from_message(
-    messages: list, default_effort: str
-) -> tuple[str, str]:
+def process_effort_from_message(messages: list, default_effort: str) -> tuple[str, str]:
     """
     Process messages to detect effort level from first word and return effort + notification.
 
@@ -223,10 +216,8 @@ def _process_effort_from_message(
 
     return default_effort, ""
 
-_USAGE_PATTERN = re.compile(r"\n\n---\n\*\*Usage\:\*\*.*?\$\d+\.\d{4}")
 
-# --- Helper function to remove notification lines from messages ---
-def _sanitize_messages_for_notifications(messages: list) -> list:
+def sanitize_messages_for_notifications(messages: list) -> list:
     """Remove notification lines from messages before sending to the model.
 
     This strips lines like "> *Reasoning set to ...*" and
@@ -262,7 +253,7 @@ def _sanitize_messages_for_notifications(messages: list) -> list:
             result = "\n".join(filtered_lines)
 
         # Remove the token usage strings. Kept for backwards compatibility (before v0.4.6, usage stats went into the assistant response)
-        result = re.sub(_USAGE_PATTERN, "", result)
+        result = re.sub(USAGE_PATTERN, "", result)
         return result
 
     for msg in messages:
@@ -277,7 +268,6 @@ def _sanitize_messages_for_notifications(messages: list) -> list:
     return messages
 
 
-# --- Main Pipe class ---
 class Pipe:
     class Valves(BaseModel):
         # User-configurable settings
@@ -345,7 +335,7 @@ class Pipe:
         if not self.valves.OPENROUTER_API_KEY:
             print("Warning: OPENROUTER_API_KEY is not set in Valves.")
 
-    async def pipes(self) -> List[dict]:
+    async def pipes(self) -> list[dict]:
         """
         Fetches available models from the OpenRouter API.
         This method is called by OpenWebUI to discover the models this pipe provides.
@@ -367,7 +357,7 @@ class Pipe:
                     models_data = await response.json()
 
             raw_models_data = models_data.get("data", [])
-            models: List[dict] = []
+            models: list[dict] = []
 
             # --- Whitelist Filtering Logic ---
             whitelist_str = (self.valves.MODEL_WHITELIST or "").strip()
@@ -424,7 +414,7 @@ class Pipe:
 
                 description = None
 
-                prompt_price, completion_price, total_price = _format_pricing(model)
+                prompt_price, completion_price, total_price = format_pricing(model)
 
                 # Add pricing information if enabled
                 pricing_info = ""
@@ -519,7 +509,7 @@ class Pipe:
             effort_notification = ""
 
             if self.valves.INCLUDE_REASONING and "messages" in payload:
-                effort_level, effort_notification = _process_effort_from_message(
+                effort_level, effort_notification = process_effort_from_message(
                     payload["messages"], effort_level
                 )
 
@@ -635,7 +625,7 @@ class Pipe:
                     print(f"Warning: Error applying MODEL_PROVIDER_BLACKLIST: {e}")
 
             # Store blacklist notification for response formatting
-            self._blacklist_notification = blacklist_notification
+            blacklist_notification = blacklist_notification
             # --- End Model-Specific Provider Blacklist ---
 
             headers = {
@@ -649,7 +639,7 @@ class Pipe:
 
             # Ensure notifications are not included in model context
             if "messages" in payload:
-                payload["messages"] = _sanitize_messages_for_notifications(payload["messages"])  # noqa: E501
+                payload["messages"] = sanitize_messages_for_notifications(payload["messages"])  # noqa: E501
 
             if is_streaming:
                 return self.stream_response(
@@ -657,6 +647,7 @@ class Pipe:
                     headers,
                     payload,
                     effort_notification,
+                    blacklist_notification,
                 )
             else:
                 content, usage = await self.non_stream_response(
@@ -664,6 +655,7 @@ class Pipe:
                     headers,
                     payload,
                     effort_notification,
+                    blacklist_notification,
                 )
                 return {"content": content, "usage": usage}
 
@@ -674,7 +666,7 @@ class Pipe:
             return f"Pipe Error: Failed to prepare request: {e}"
 
     async def non_stream_response(
-        self, url, headers, payload, effort_notification
+        self, url, headers, payload, effort_notification, blacklist_notification
     ) -> tuple[str, dict]:
         """Handles non-streaming API requests."""
         try:
@@ -708,7 +700,6 @@ class Pipe:
                 final += effort_notification
 
             # Add blacklist notification if present
-            blacklist_notification = getattr(self, "_blacklist_notification", "")
             if blacklist_notification:
                 final += blacklist_notification
 
@@ -738,7 +729,7 @@ class Pipe:
             return f"Pipe Error: Unexpected error processing response: {e}", {}
 
     async def stream_response(
-        self, url, headers, payload, effort_notification
+        self, url, headers, payload, effort_notification, blacklist_notification
     ) -> AsyncGenerator[str, None]:
         """Handles streaming API requests using a generator."""
         try:
@@ -749,7 +740,7 @@ class Pipe:
                     response.raise_for_status()
 
                     in_think = False
-                    latest_citations: List[str] = []
+                    latest_citations: list[str] = []
                     latest_usage = {}
                     first_chunk = True
 
@@ -785,8 +776,7 @@ class Pipe:
                                 if effort_notification:
                                     yield effort_notification
 
-                                # Add blacklist notification if present
-                                blacklist_notification = getattr(self, "_blacklist_notification", "")
+                                 # Add blacklist notification if present
                                 if blacklist_notification:
                                     yield blacklist_notification
 
