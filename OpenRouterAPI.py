@@ -1,17 +1,22 @@
 """
 title: OpenRouter Integration for OpenWebUI
-version: 0.4.6
+version: 0.5.0
 description: Integration with OpenRouter for OpenWebUI with Free Model Filtering and optional field improvements
 author: kevarch
 author_url: https://github.com/kevarch
 contributors:
     Eloi Marques da Silva (https://github.com/eloimarquessilva),
     Scythe Eden (https://github.com/DarkEden-coding),
-    Kevin Pham (https://github.com/konmeo)
+    Kevin Pham (https://github.com/konmeo),
+    grmx (https://github.com/2048khz-gachi-rmx)
 credits: rburmorrison (https://github.com/rburmorrison), Google Gemini Pro 2.5, Claude 4 Sonnet
 license: MIT
 
 Changelog:
+- Version 0.5.0:
+  * Contribution by grmx
+  * Move pipe functions to async to not block OpenWebUI's event loop (as per: https://docs.openwebui.com/features/extensibility/plugin/functions/pipe)
+  * Micro-optimizations on response parsing
 - Version 0.4.6:
   * Contribution by Kevin Pham
   * Changed FREE_ONLY with MAX_INPUT_PRICE parameter to optionally filter and set set model price cap
