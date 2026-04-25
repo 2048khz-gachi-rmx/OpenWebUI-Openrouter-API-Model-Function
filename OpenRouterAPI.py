@@ -87,11 +87,7 @@ def insert_citations(text: str, citations: list[str]) -> str:
         except (ValueError, IndexError):
             return match_obj.group(0)
 
-    try:
-        return re.sub(CITATION_PATTERN, replace_citation, text)
-    except Exception as e:
-        print(f"Error during citation insertion: {e}")
-        return text
+    return re.sub(CITATION_PATTERN, replace_citation, text)
 
 
 def format_citation_list(citations: list[str]) -> str:
@@ -108,12 +104,8 @@ def format_citation_list(citations: list[str]) -> str:
     if not citations:
         return ""
 
-    try:
-        citation_list = [f"{i+1}. {url}" for i, url in enumerate(citations)]
-        return "\n\n---\nCitations:\n" + "\n".join(citation_list)
-    except Exception as e:
-        print(f"Error formatting citation list: {e}")
-        return ""
+    citation_list = [f"{i+1}. {url}" for i, url in enumerate(citations)]
+    return "\n\n---\nCitations:\n" + "\n".join(citation_list)
 
 
 def format_pricing(model_data: dict) -> tuple[str, str, str]:
@@ -562,7 +554,6 @@ class Pipe:
                 except Exception as cache_err:
                     print(f"Warning: Error applying cache_control logic: {cache_err}")
                     traceback.print_exc()
-            # --- End Cache Control Logic ---
 
             # --- Apply Reasoning Logic ---
             if self.valves.INCLUDE_REASONING:
@@ -576,12 +567,10 @@ class Pipe:
 
                 # Add reasoning configuration to payload
                 payload["reasoning"] = {"effort": effort_level}
-            # --- End Reasoning Logic ---
 
             # --- Apply Usage Tracking ---
             if self.valves.SHOW_USAGE_STATS:
                 payload["usage"] = {"include": True}
-            # --- End Usage Tracking ---
 
             # --- Apply Model-Specific Provider Blacklist ---
             blacklist_notification = ""
@@ -628,10 +617,6 @@ class Pipe:
 
                 except Exception as e:
                     print(f"Warning: Error applying MODEL_PROVIDER_BLACKLIST: {e}")
-
-            # Store blacklist notification for response formatting
-            blacklist_notification = blacklist_notification
-            # --- End Model-Specific Provider Blacklist ---
 
             headers = {
                 "Authorization": f"Bearer {self.valves.OPENROUTER_API_KEY}",
@@ -698,23 +683,17 @@ class Pipe:
             reasoning = insert_citations(reasoning, citations)
             citation_list = format_citation_list(citations)
 
-            final = ""
+            parts = list(filter(None, [
+                effort_notification,
+                blacklist_notification,
+                f"<think>\n{reasoning}\n</think>\n\n" if reasoning else None,
+                content or None,
+            ]))
 
-            # Add effort notification if present
-            if effort_notification:
-                final += effort_notification
+            if parts:
+                parts.append(citation_list)
 
-            # Add blacklist notification if present
-            if blacklist_notification:
-                final += blacklist_notification
-
-            if reasoning:
-                final += f"<think>\n{reasoning}\n</think>\n\n"
-            if content:
-                final += content
-            if final:
-                final += citation_list
-            return final, usage
+            return "".join(parts), usage
 
         except aiohttp.ClientConnectorError:
             return "Pipe Error: Network connection failed", {}
@@ -761,27 +740,22 @@ class Pipe:
                         except json.JSONDecodeError:
                             continue
 
-                        if "choices" in chunk:
+                        if "choices" in chunk and chunk["choices"]:
                             choice = chunk["choices"][0]
-                            citations = chunk.get("citations")
-                            if citations is not None:
-                                latest_citations = citations
-
-                            # Track usage information
-                            usage = chunk.get("usage")
-                            if usage is not None:
-                                latest_usage = usage
 
                             delta = choice.get("delta", {})
                             content = delta.get("content", "")
                             reasoning = delta.get("reasoning", "")
 
-                            # Add effort notification at the beginning
+                            citations = chunk.get("citations")
+                            if citations is not None:
+                                latest_citations = citations
+
+                            # On first arrived chunk, emit notifications
                             if first_chunk:
                                 if effort_notification:
                                     yield effort_notification
 
-                                 # Add blacklist notification if present
                                 if blacklist_notification:
                                     yield blacklist_notification
 
@@ -800,6 +774,10 @@ class Pipe:
                                     yield "\n</think>\n\n"
                                     in_think = False
                                 yield insert_citations(content, latest_citations)
+
+                        # Track usage information
+                        if chunk.get("usage"):
+                            latest_usage = chunk.get("usage")
 
                     # If model ended while still in <think>, close it
                     if in_think:
