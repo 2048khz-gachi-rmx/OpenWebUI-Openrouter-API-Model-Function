@@ -1,6 +1,6 @@
 """
 title: OpenRouter Integration for OpenWebUI
-version: 0.5.0
+version: 0.5.1
 description: Integration with OpenRouter for OpenWebUI with Free Model Filtering and optional field improvements
 author: kevarch
 author_url: https://github.com/kevarch
@@ -13,6 +13,10 @@ credits: rburmorrison (https://github.com/rburmorrison), Google Gemini Pro 2.5, 
 license: MIT
 
 Changelog:
+- Version 0.5.1:
+  * Contribution by grmx
+  * Fixed tool calls not working: streaming and non-streaming responses now forward tool_calls from model responses
+  * Fixed DeepSeek v4 tool call support: extracts reasoning from tags into reasoning_content, removes incomplete tool-call sequences
 - Version 0.5.0:
   * Contribution by grmx
   * Move pipe functions to async to not block OpenWebUI's event loop (as per: https://docs.openwebui.com/features/extensibility/plugin/functions/pipe)
@@ -212,6 +216,85 @@ def process_effort_from_message(messages: list, default_effort: str) -> tuple[st
         return first_word, effort_notification
 
     return default_effort, ""
+
+
+def fix_deepseek_tool_call_messages(messages: list, model_id: str) -> list:
+    """Fix DeepSeek v4 messages for tool call compatibility.
+
+    1. Removes incomplete tool-call sequences (assistant messages with tool_calls
+       not followed by matching tool result messages).
+    2. Extracts reasoning from tags into reasoning_content field.
+
+    Args:
+        messages: Message list in OpenAI chat format.
+        model_id: The model ID being requested.
+
+    Returns:
+        Fixed message list.
+    """
+    if not isinstance(messages, list):
+        return messages
+
+    # Only apply to DeepSeek models
+    model_lower = model_id.lower() if model_id else ""
+    if "deepseek" not in model_lower:
+        return messages
+
+    # Step 1: Find assistant messages with incomplete tool_calls and remove them
+    to_remove = set()
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tool_call_ids = {
+                tc["id"] for tc in msg["tool_calls"] if tc.get("id")
+            }
+            j = i + 1
+            matched_ids = set()
+            while j < len(messages) and messages[j].get("role") == "tool":
+                matched_ids.add(messages[j].get("tool_call_id"))
+                j += 1
+
+            if tool_call_ids - matched_ids:
+                to_remove.add(i)
+                k = i + 1
+                while k < j:
+                    to_remove.add(k)
+                    k += 1
+                i = j
+                continue
+        i += 1
+
+    if to_remove:
+        messages = [m for i, m in enumerate(messages) if i not in to_remove]
+
+    # Step 2: Extract reasoning from tags into reasoning_content
+    thinking_open = "<think>"
+    thinking_close = "</think>"
+    for msg in messages:
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            continue
+
+        content = msg.get("content")
+        if not isinstance(content, str) or thinking_open not in content:
+            continue
+
+        start = content.index(thinking_open) + len(thinking_open)
+        end = content.index(thinking_close)
+        reasoning = content[start:end].strip()
+
+        if reasoning:
+            msg["reasoning_content"] = reasoning
+
+        msg["content"] = content.replace(
+            content[start-len(thinking_open):end+len(thinking_close)],
+            ""
+        ).strip()
+
+        if not msg["content"]:
+            msg["content"] = None
+
+    return messages
 
 
 def sanitize_messages_for_notifications(messages: list) -> list:
@@ -631,6 +714,12 @@ class Pipe:
             if "messages" in payload:
                 payload["messages"] = sanitize_messages_for_notifications(payload["messages"])  # noqa: E501
 
+            # Fix DeepSeek v4 tool-call messages: extract reasoning to reasoning_content
+            if "messages" in payload:
+                payload["messages"] = fix_deepseek_tool_call_messages(
+                    payload["messages"], payload.get("model", "")
+                )
+
             if is_streaming:
                 return self.stream_response(
                     url,
@@ -640,14 +729,17 @@ class Pipe:
                     blacklist_notification,
                 )
             else:
-                content, usage = await self.non_stream_response(
+                content, usage, tool_calls = await self.non_stream_response(
                     url,
                     headers,
                     payload,
                     effort_notification,
                     blacklist_notification,
                 )
-                return {"content": content, "usage": usage}
+                resp = {"content": content, "usage": usage}
+                if tool_calls:
+                    resp["tool_calls"] = tool_calls
+                return resp
 
 
         except Exception as e:
@@ -657,20 +749,22 @@ class Pipe:
 
     async def non_stream_response(
         self, url, headers, payload, effort_notification, blacklist_notification
-    ) -> tuple[str, dict]:
+    ) -> tuple[str, dict, list]:
         """Handles non-streaming API requests."""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT)
                 ) as response:
-                    response.raise_for_status()
+                    if response.status >= 400:
+                        error_body = await response.text()
+                        return f"Pipe Error: API returned HTTP {response.status}: {error_body[:500]}", {}, []
                     res = await response.json()
 
             usage = res.get("usage", {})
 
             if not res.get("choices"):
-                return "", usage
+                return "", usage, []
 
             choice = res["choices"][0]
             message = choice.get("message", {})
@@ -678,6 +772,7 @@ class Pipe:
 
             content = message.get("content", "")
             reasoning = message.get("reasoning", "")
+            tool_calls = message.get("tool_calls", [])
 
             content = insert_citations(content, citations)
             reasoning = insert_citations(reasoning, citations)
@@ -693,12 +788,12 @@ class Pipe:
             if parts:
                 parts.append(citation_list)
 
-            return "".join(parts), usage
+            return "".join(parts), usage, tool_calls
 
         except aiohttp.ClientConnectorError:
-            return "Pipe Error: Network connection failed", {}
+            return "Pipe Error: Network connection failed", {}, []
         except asyncio.TimeoutError:
-            return f"Pipe Error: Request timed out ({self.valves.REQUEST_TIMEOUT}s)", {}
+            return f"Pipe Error: Request timed out ({self.valves.REQUEST_TIMEOUT}s)", {}, []
         except aiohttp.ClientResponseError as e:
             error_msg = f"Pipe Error: API returned HTTP {e.status}"
             try:
@@ -706,11 +801,11 @@ class Pipe:
                     error_msg += f": {e.message}"
             except Exception:
                 pass
-            return error_msg, {}
+            return error_msg, {}, []
         except Exception as e:
             print(f"Unexpected error in non_stream_response: {e}")
             traceback.print_exc()
-            return f"Pipe Error: Unexpected error processing response: {e}", {}
+            return f"Pipe Error: Unexpected error processing response: {e}", {}, []
 
     async def stream_response(
         self, url, headers, payload, effort_notification, blacklist_notification
@@ -721,7 +816,10 @@ class Pipe:
                 async with session.post(
                     url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT)
                 ) as response:
-                    response.raise_for_status()
+                    if response.status >= 400:
+                        error_body = await response.text()
+                        yield f"Pipe Error: API returned HTTP {response.status}: {error_body[:500]}"
+                        return
 
                     in_think = False
                     latest_citations: list[str] = []
@@ -746,6 +844,7 @@ class Pipe:
                             delta = choice.get("delta", {})
                             content = delta.get("content", "")
                             reasoning = delta.get("reasoning", "")
+                            tool_calls = delta.get("tool_calls")
 
                             citations = chunk.get("citations")
                             if citations is not None:
@@ -774,6 +873,10 @@ class Pipe:
                                     yield "\n</think>\n\n"
                                     in_think = False
                                 yield insert_citations(content, latest_citations)
+
+                            # Stream tool_calls immediately
+                            if tool_calls:
+                                yield f"data: {json.dumps(chunk)}\n\n"
 
                         # Track usage information
                         if chunk.get("usage"):
