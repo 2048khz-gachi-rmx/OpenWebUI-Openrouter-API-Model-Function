@@ -1,6 +1,6 @@
 """
 title: OpenRouter Integration for OpenWebUI
-version: 0.5.1
+version: 0.5.2
 description: Integration with OpenRouter for OpenWebUI with Free Model Filtering and optional field improvements
 author: kevarch
 author_url: https://github.com/kevarch
@@ -13,6 +13,9 @@ credits: rburmorrison (https://github.com/rburmorrison), Google Gemini Pro 2.5, 
 license: MIT
 
 Changelog:
+- Version 0.5.2:
+  * Contribution by grmx
+  * Improved model provider filters: added whitelisting and an easier valve format
 - Version 0.5.1:
   * Contribution by grmx
   * Fixed tool calls not working: streaming and non-streaming responses now forward tool_calls from model responses
@@ -326,6 +329,8 @@ def sanitize_messages_for_notifications(messages: list) -> list:
                 stripped = line.strip()
                 if stripped.startswith("> *Reasoning set to ") and stripped.endswith("*"):
                     continue
+                if stripped.startswith("> *Restricting providers for ") and stripped.endswith("*"):
+                    continue
                 if stripped.startswith("> *Ignoring providers for ") and stripped.endswith("*"):
                     continue
                 filtered_lines.append(line)
@@ -347,6 +352,58 @@ def sanitize_messages_for_notifications(messages: list) -> list:
                     part["text"] = remove_notification_lines(part_text)
     return messages
 
+def parse_model_provider_list(raw: str) -> dict[str, list[str]]:
+    """Parse a model→provider mapping string into a dict.
+
+    Accepts flexible formatting: spaces are stripped, and either '=' or ':'
+    may be used to separate the model pattern from its provider list.
+    Providers are separated by commas. Entries are separated by ';' or newlines.
+
+    Examples (all parse identically)::
+
+        'model1=provider1,provider2;model2:provider2'
+        'model1 = provider1, provider2 \n model2 = provider2'
+
+    Args:
+        raw: Raw string from the valve setting.
+
+    Returns:
+        Dict mapping lowercased model pattern to a list of lowercased providers.
+    """
+    result: dict[str, list[str]] = {}
+    if not raw or not raw.strip():
+        return result
+
+    # Normalize newlines to semicolons for uniform splitting
+    raw = raw.replace("\n", ";")
+
+    for rule in raw.split(";"):
+        rule = rule.strip()
+        if not rule:
+            continue
+
+        # Support both '=' and ':' as the model/provider separator.
+        # Use '=' if present, otherwise fall back to ':'.
+        sep = "=" if "=" in rule else ":"
+        if sep not in rule:
+            continue
+
+        model_pattern, providers_str = rule.split(sep, 1)
+        model_pattern = model_pattern.strip().lower()
+
+        if not model_pattern:
+            continue
+
+        providers = [
+            p.strip().lower()
+            for p in providers_str.split(",")
+            if p.strip()
+        ]
+
+        if providers:
+            result[model_pattern] = providers
+
+    return result
 
 class Pipe:
     class Valves(BaseModel):
@@ -384,9 +441,22 @@ class Pipe:
             default=None,
             description="Comma-separated list of specific model IDs to include. If set, only these models will be available. Leave empty to use provider filtering instead.",
         )
-        MODEL_PROVIDER_BLACKLIST: Optional[str] = Field(
-            default=None,
-            description="Model-specific provider blacklist in format 'model1:provider1,provider2;model2:provider3'. Example: 'gpt-4:openai;claude:anthropic,aws' would exclude OpenAI's GPT-4 and Anthropic/AWS versions of Claude models.",
+        MODEL_PROVIDER_BLACKLIST: str = Field(
+            default="",
+            examples=["gpt-4 = openai\nclaude = anthropic, aws"],
+            description=(
+                "Model-specific provider blacklist. Spaces are ignored. Use '=' or ':' to separate the model from its provider list, and use `;` or a newline to separate model-provider pairs.\n\n"
+                "Examples: 'gpt-4:openai; claude:anthropic,aws' or\n```\ngpt-4:openai\nclaude=anthropic, aws\n```\nwould exclude OpenAI's GPT-4 and Anthropic/AWS versions of Claude models."
+            ),
+        )
+        MODEL_PROVIDER_WHITELIST: str = Field(
+            default="",
+            examples=["gpt-4 = openai\nclaude = anthropic,aws"],
+            description=(
+                "Model-specific provider whitelist in the same format as the blacklist. "
+                "When a model matches, only the listed providers will be used. "
+                "Example: 'claude=anthropic' would only use Anthropic's Claude."
+            ),
         )
         ENABLE_CACHE_CONTROL: bool = Field(
             default=False,
@@ -655,51 +725,72 @@ class Pipe:
             if self.valves.SHOW_USAGE_STATS:
                 payload["usage"] = {"include": True}
 
-            # --- Apply Model-Specific Provider Blacklist ---
+            # --- Apply Model-Specific Provider Whitelist / Blacklist ---
             blacklist_notification = ""
-            if self.valves.MODEL_PROVIDER_BLACKLIST and "model" in payload:
+            whitelist_notification = ""
+            if (self.valves.MODEL_PROVIDER_BLACKLIST or self.valves.MODEL_PROVIDER_WHITELIST) and "model" in payload:
                 model_id = payload["model"]
-                blacklist_str = self.valves.MODEL_PROVIDER_BLACKLIST.strip()
-                ignored_providers = []
+                model_name_part = (
+                    model_id.split("/", 1)[1].lower()
+                    if "/" in model_id
+                    else model_id.lower()
+                )
 
-                try:
-                    # Parse format: 'model1:provider1,provider2;model2:provider3'
-                    for model_rule in blacklist_str.split(';'):
-                        if ':' in model_rule:
-                            model_pattern, providers_str = model_rule.split(':', 1)
-                            model_pattern = model_pattern.strip().lower()
+                blacklist_map = parse_model_provider_list(
+                    self.valves.MODEL_PROVIDER_BLACKLIST
+                )
+                whitelist_map = parse_model_provider_list(
+                    self.valves.MODEL_PROVIDER_WHITELIST
+                )
 
-                            # Check if current model matches the pattern
-                            model_name_part = (
-                                model_id.split("/", 1)[1].lower()
-                                if "/" in model_id
-                                else model_id.lower()
-                            )
+                ignored_providers: list[str] = []
+                allowed_providers: list[str] = []
 
-                            # Support partial matching for model names
-                            if model_pattern in model_name_part or model_pattern in model_id.lower():
-                                providers = [
-                                    p.strip().lower()
-                                    for p in providers_str.split(',')
-                                    if p.strip()
-                                ]
-                                ignored_providers.extend(providers)
+                # 1. Check for exact matches first
+                exact_blacklist = blacklist_map.get(model_name_part) or blacklist_map.get(model_id.lower())
+                exact_whitelist = whitelist_map.get(model_name_part) or whitelist_map.get(model_id.lower())
 
-                    # Apply provider blacklist to request if any providers should be ignored
-                    if ignored_providers:
-                        # Remove duplicates while preserving order
-                        ignored_providers = list(dict.fromkeys(ignored_providers))
+                if exact_blacklist or exact_whitelist:
+                    if exact_blacklist:
+                        ignored_providers.extend(exact_blacklist)
+                    if exact_whitelist:
+                        allowed_providers.extend(exact_whitelist)
+                else:
+                    # 2. Fallback to fuzzy match (contains) if no exact match
+                    for model_pattern, providers in blacklist_map.items():
+                        if model_pattern in model_name_part or model_pattern in model_id.lower():
+                            ignored_providers.extend(providers)
 
-                        # Add provider object to payload
-                        if "provider" not in payload:
-                            payload["provider"] = {}
-                        payload["provider"]["ignore"] = ignored_providers
+                    for model_pattern, providers in whitelist_map.items():
+                        if model_pattern in model_name_part or model_pattern in model_id.lower():
+                            allowed_providers.extend(providers)
 
-                        # Create notification
-                        blacklist_notification = f"> *Ignoring providers for {model_id}: {', '.join(ignored_providers)}*\n\n"
+                # Remove duplicates while preserving order
+                ignored_providers = list(dict.fromkeys(ignored_providers))
+                allowed_providers = list(dict.fromkeys(allowed_providers))
 
-                except Exception as e:
-                    print(f"Warning: Error applying MODEL_PROVIDER_BLACKLIST: {e}")
+                # 3. Whitelist cancels blacklist (whitelist wins if provider is in both)
+                if allowed_providers:
+                    ignored_providers = [
+                        p for p in ignored_providers if p not in allowed_providers
+                    ]
+
+                if "provider" not in payload:
+                    payload["provider"] = {}
+
+                if ignored_providers:
+                    payload["provider"]["ignore"] = ignored_providers
+                    blacklist_notification = (
+                        f"> *Ignoring providers for {model_id}: "
+                        f"{', '.join(ignored_providers)}*\n\n"
+                    )
+
+                if allowed_providers:
+                    payload["provider"]["only"] = allowed_providers
+                    whitelist_notification = (
+                        f"> *Restricting providers for {model_id}: "
+                        f"{', '.join(allowed_providers)}*\n\n"
+                    )
 
             headers = {
                 "Authorization": f"Bearer {self.valves.OPENROUTER_API_KEY}",
@@ -727,6 +818,7 @@ class Pipe:
                     payload,
                     effort_notification,
                     blacklist_notification,
+                    whitelist_notification,
                 )
             else:
                 content, usage, tool_calls = await self.non_stream_response(
@@ -735,6 +827,7 @@ class Pipe:
                     payload,
                     effort_notification,
                     blacklist_notification,
+                    whitelist_notification,
                 )
                 resp = {"content": content, "usage": usage}
                 if tool_calls:
@@ -748,7 +841,7 @@ class Pipe:
             return f"Pipe Error: Failed to prepare request: {e}"
 
     async def non_stream_response(
-        self, url, headers, payload, effort_notification, blacklist_notification
+        self, url, headers, payload, effort_notification, blacklist_notification, whitelist_notification
     ) -> tuple[str, dict, list]:
         """Handles non-streaming API requests."""
         try:
@@ -780,6 +873,7 @@ class Pipe:
 
             parts = list(filter(None, [
                 effort_notification,
+                whitelist_notification,
                 blacklist_notification,
                 f"<think>\n{reasoning}\n</think>\n\n" if reasoning else None,
                 content or None,
@@ -808,7 +902,7 @@ class Pipe:
             return f"Pipe Error: Unexpected error processing response: {e}", {}, []
 
     async def stream_response(
-        self, url, headers, payload, effort_notification, blacklist_notification
+        self, url, headers, payload, effort_notification, blacklist_notification, whitelist_notification
     ) -> AsyncGenerator[str, None]:
         """Handles streaming API requests using a generator."""
         try:
@@ -854,6 +948,9 @@ class Pipe:
                             if first_chunk:
                                 if effort_notification:
                                     yield effort_notification
+
+                                if whitelist_notification:
+                                    yield whitelist_notification
 
                                 if blacklist_notification:
                                     yield blacklist_notification
